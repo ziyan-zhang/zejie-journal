@@ -17,7 +17,7 @@
 
 #define AVERAGE_PAGE_SIZE 16384 //16K
 #define PAGECACHE_RATIO (10) //TODO 10
-#define PAGECACHE_NUM 16
+#define PAGECACHE_NUM 16    // 这里应该是指对page cache分了16个shard，每个shard有一个LRU cache
 
 
 class PageCache {

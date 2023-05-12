@@ -47,7 +47,7 @@ void Page::LockPage(PageLock lock_type) {
             pthread_rwlock_rdlock(&this->page_rw_lock);
             break;
         default:
-            break;
+            break;    // 其实变成panic比较好，因为不该来这里
     }
 }
 

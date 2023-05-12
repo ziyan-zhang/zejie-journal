@@ -9,7 +9,7 @@
 /**
  * we should use reference count since the page may be delete before set dirty for some update operations
  * @param page
- * @return
+ * @return  非脏且引用计数为0的页才能被移除
  */
 bool PageRemovable(std::shared_ptr<Page>& page) {
     return (!page->Dirty() && !page->RefCount());
@@ -19,16 +19,19 @@ bool PageRemovable(std::shared_ptr<Page>& page) {
 //    if (page != nullptr) delete page;
 //}
 
+// 根据journal和objstore的情况，计算出page cache的容量
 PageCache::PageCache(Journal* journal, ObjStore* objstore) {
     struct sysinfo s_info;
     int error;
     error = sysinfo(&s_info);
     if (error) LOG(ERROR) << "get sysinfo error";
 
+    // 空余内存的1/10用于存cache, this->cache_capacity是算出来的能放的页面数
     this->cache_capacity = (s_info.freeram / (AVERAGE_PAGE_SIZE*PAGECACHE_RATIO));
 //    LOG(INFO) << "freeram: " << s_info.freeram;
     LOG(INFO) << "page cache capacity: " << this->cache_capacity;
 
+    // 初始化LRU cache
     for (int i = 0; i < PAGECACHE_NUM; i++) {
         lru_cache[i] = new LRUCache<PageKey, std::shared_ptr<Page>>((this->cache_capacity / PAGECACHE_NUM), nullptr, PageRemovable);
         pthread_mutex_init(&this->pc_mutex[i], nullptr);
@@ -37,6 +40,7 @@ PageCache::PageCache(Journal* journal, ObjStore* objstore) {
     this->objstore = objstore;
 }
 
+// 遍历每个cache，把相应的cache清空，把锁删除，把cache删除
 PageCache::~PageCache() {
     //TODO should wait checkpoint
     LOG(INFO) << "pagecache desturct";
@@ -48,7 +52,7 @@ PageCache::~PageCache() {
     }
 }
 
-
+// 根据object id或offset（取决于oid的类型）计算出page key并返回page key
 uint32_t PageCache::OID2Key(const ObjID& oid, uint32_t off) {
     uint32_t key;
     switch (oid.type) {
@@ -93,35 +97,35 @@ uint32_t PageCache::OID2Key(const ObjID& oid, uint32_t off) {
 std::shared_ptr<Page> PageCache::AllocAndGetPage(const ObjID& oid, uint32_t off, uint32_t page_size) {
     std::shared_ptr<Page> page = nullptr;
     PageKey page_idx;
-    OidToPageKey(oid, off, page_idx);
+    OidToPageKey(oid, off, page_idx);   // 将oid的node属性设为off，并拷贝到page_idx中
 
 //    std::string page_idx = oid + ":";
 //    page_idx += std::to_string(off);
-    page = std::make_shared<Page>(page_size, oid, off);
+    page = std::make_shared<Page>(page_size, oid, off); // std::make_shared<Page>会调用Page的构造函数
 //    if (this->objstore->ObjAccess(oid) == GCFSErr_PATHNOTEXISTS) {
 //        this->objstore->ObjAlloc(oid);
-        this->journal->AllocObj(oid);
+        this->journal->AllocObj(oid);   // TODO: 这里的journal->AllocObj做了什么？
 //    }
 
-    uint32_t pc_idx = (OID2Key(oid, off/page_size) % PAGECACHE_NUM);
+    uint32_t pc_idx = (OID2Key(oid, off/page_size) % PAGECACHE_NUM);    // 当前key的cache在哪个shard中
     pthread_mutex_lock(&this->pc_mutex[pc_idx]);
-    while (!lru_cache[pc_idx]->Contains(page_idx)) {
-        int ret = lru_cache[pc_idx]->Insert(page_idx, page);
+    while (!lru_cache[pc_idx]->Contains(page_idx)) {    // 当前cache shard不包含当前page索引，证明没缓存。注意这里用了while每次都判断
+        int ret = lru_cache[pc_idx]->Insert(page_idx, page);    // 那就插入这项缓存
         if (ret) {
             if (journal->CheckPointListEmpty()) { //TODO all the page is dirty??? wait for commit and ck???
                 //nothing to checkpoint, insert force temporarily
                 ret = lru_cache[pc_idx]->Insert(page_idx, page, true);
                 break;
             }
-            pthread_mutex_unlock(&this->pc_mutex[pc_idx]);
+            pthread_mutex_unlock(&this->pc_mutex[pc_idx]);  // 这里对cache的操作就是插入新的项，现在做完了，释放锁
             //cache full, checkpoint async to free pages
             this->journal->CallCheckpoint(true);
             this->journal->WaitForCheckpointDone();
-            pthread_mutex_lock(&this->pc_mutex[pc_idx]);
+            pthread_mutex_lock(&this->pc_mutex[pc_idx]);    // checkpoint完成了，重新获取锁。对接while后面的插入缓存项
         }
     }
     int ret = lru_cache[pc_idx]->Get(page_idx, page);
-    page->Get();
+    page->Get();    // page->Get()做的事情是this->ref_count++，这个引用计数跟（其他）page的分配和释放有关，所以用单独的全局锁
     pthread_mutex_unlock(&this->pc_mutex[pc_idx]);
     return page;
 }
@@ -147,7 +151,7 @@ std::shared_ptr<Page> PageCache::GetPage(const ObjID& oid, uint32_t off, uint32_
         while (!lru_cache[pc_idx]->Contains(page_idx)) {
 
             if (page == nullptr) {
-                //alloc new page and read data from globalcache
+                // 分配新的页，并从globalcache中读数据
                 page = std::make_shared<Page>(page_size, oid, off);
 //                if (this->objstore->ObjAccess(oid) == GCFSErr_PATHNOTEXISTS) {
 //                    this->objstore->ObjAlloc(oid);
@@ -176,7 +180,7 @@ std::shared_ptr<Page> PageCache::GetPage(const ObjID& oid, uint32_t off, uint32_
     if (ret) {
         //TODO not found, can't be appeared add LOG
     }
-    //add reference count
+    // 增加页面的引用计数
     if (ref_page)
         page->Get();
 
@@ -184,6 +188,7 @@ std::shared_ptr<Page> PageCache::GetPage(const ObjID& oid, uint32_t off, uint32_
     return page;
 }
 
+// 减少页面的引用计数
 void PageCache::PutPage(std::shared_ptr<Page>& page) {
-    page->Put();
+    page->Put();    // todo: 这里可以不用锁吗？
 }

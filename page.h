@@ -18,6 +18,8 @@
 #define PAGE_NEED_ADD_TX_LIST       (1U << 2)
 #define PAGE_ADD_NEXT_RUNNING_LIST  (1U << 3)
 
+// PageKey包含两个uint64_t的高8字节和低8字节，用于标识一个page。、
+// Pagekey中定义了==和<两个操作符，用于比较两个PageKey是否相等和大小。
 struct PageKey {
     uint64_t page_key_h;
     uint64_t page_key_l;
@@ -32,6 +34,7 @@ struct PageKey {
     }
 };
 
+// 将objID的node属性设为off，并拷贝到PageKey
 static inline void OidToPageKey(const ObjID& oid, uint32_t off, PageKey& page_key) {
     ObjID oid_temp = oid;
     oid_temp.node = off;
@@ -53,10 +56,11 @@ public:
     uint32_t page_size;             //inode page,FIQ page 4K; dentry pages are larger (32K)
 
     char* data;
-    char* frozen_data;              //the copy of the old page data for committing tx if the running tx want to modify the page data
-    uint32_t modified;              //this flag signals the page has been modified by the current running tx
-    Transaction* tx;                //pointer to transaction which owns this page (committing or running tx)
-    Transaction* next_tx;           //pointer to the current running transaction which is modifying the page and the page is already in a committing tx
+    char* frozen_data;      // 旧page数据的拷贝，用于committing。如果running tx想要修改committing tx的page数据时，committing tx需要先拷贝一份旧数据
+    uint32_t modified;      // 该页面已被当前running tx修改
+    // 默认日志中，running tx不能有两个，但是running tx和committing tx可以各有一个
+    Transaction* tx;            // 指向拥有该页面的tx（committing or running tx）的指针
+    Transaction* next_tx;       // 指向当前runningtx，该running tx 正在修改一个 已经属于某committing tx 的页面。
     ObjID oid;                      //obj id
     uint32_t off;                   //page offset in obj (in bytes)
 
