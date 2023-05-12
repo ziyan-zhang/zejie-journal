@@ -98,6 +98,7 @@ Transaction* Journal::StartTx() {
         pthread_cond_wait(&this->commit_state_cond, &this->journal_tx_mutex);
     }
 
+    // todo: 这里一定是空吗？commit_tx由WAITTING_COMMIT变为TX_COMMITTING时，能不能有非空running存在？
     if (this->running_tx == nullptr) {
         this->running_tx = new Transaction();
         this->running_tx->tx_state = TX_RUNNING;
@@ -116,7 +117,7 @@ Transaction* Journal::StartTx() {
  */
 void Journal::StopTx(Transaction* tx) {
     pthread_mutex_lock(&this->journal_tx_mutex);
-    tx->ref_count--;    // todo: 除了初始化tx，还有什么时候会ref_count++?
+    tx->ref_count--;    // 初始化tx时ref_count++，跟这个对称。唯一的一对tx->ref_count++/--
     if (tx->ref_count <= 0) {
         //notify commit thread to start commit (if the commit thread is waiting)
         pthread_cond_signal(&tx->ref_cond);     // ref_cond用于在commit时等待ref_count==0
