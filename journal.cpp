@@ -123,16 +123,16 @@ void Journal::StopTx(Transaction* tx) {
         pthread_cond_signal(&tx->ref_cond);     // ref_cond用于在commit时等待ref_count==0
     }
 
+    // tx的块太多了，需要停下来（等待同步的commit）在放tx继续运行
     if (tx->block_num >= STOP_TX_MAX_BLOCK_NUM && this->commit_tx != nullptr && this->commit_tx->tx_state == TX_COMMITTING) {
-        //  当前tx太大，阻塞所有操作，等待commit完成（同步的commit）
         WaitForCommitDone();
     }
 //    LOG(INFO) << "StopTx: " << tx->ref_count;
 
     pthread_mutex_unlock(&this->journal_tx_mutex);
 
+    // 异步提交tx（异步的commit）
     if (tx->block_num >= TX_MAX_BLOCK_NUM) {
-        // 异步提交tx（异步的commit）
         CallCommit();
     }
 

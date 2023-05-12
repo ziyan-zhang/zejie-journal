@@ -44,8 +44,29 @@ Commit
 
 Kjournald线程与每个进行日志的设备相关联。Kjournald线程保证运行中的事务会在一个特定的时间间隔后被提交。事务提交的代码分成了如下八个不同的阶段。图1给出了日志的逻辑结构。
 ![](2023-05-12-16-23-13.png)
-阶段0：将事务的状态从运行（T_RUNNING）变为锁定（T_LOCKED），这样，这个事务就不能再添加新的handle了。事务会等待所有的handle都完成的。当事务初始化的时候，会预留一部分缓冲区。在这一阶段，有些缓冲区可能没有使用，就被释放了。在这里，所有事务都完成了之后，事务就已经准备好了可以被提交了。
-代码上，首先committing tx获得running tx, running tx清空，然后在互斥量tx_mutex上等一个commit_tx的ref_cond条件变量, 把事务状态从WAITTING_COMMIT(LOCKED)变为COMMITTING
+
+阶段0：将事务的状态从运行（T_RUNNING）变为锁定（T_LOCKED，TX_WAITTING_COMMIT），这样，这个事务就不能再添加新的handle了。事务会等待所有的handle都完成的。当事务初始化的时候，会预留一部分缓冲区。在这一阶段，有些缓冲区可能没有使用，就被释放了。在这里，所有事务都完成了之后，事务就已经准备好了可以被提交了。
+
+代码上，WAITTING_COMMIT状态下，新的running_tx不能建立，要等待Journal对象的commit_state_cond：
+```cpp
+Transaction* Journal::StartTx() {
+    pthread_mutex_lock(&this->journal_tx_mutex);
+    if (this->commit_tx != nullptr && this->commit_tx->tx_state == TX_WAITTING_COMMIT) {
+        pthread_cond_wait(&this->commit_state_cond, &this->journal_tx_mutex);
+    }
+
+    if (this->running_tx == nullptr) {
+        this->running_tx = new Transaction();
+        this->running_tx->tx_state = TX_RUNNING;
+    }
+    this->running_tx->ref_count++;
+    Transaction* tx = this->running_tx;
+    pthread_mutex_unlock(&this->journal_tx_mutex);
+    return tx;
+}
+```
+而commit_state_cond由谁唤醒呢？由CommitUnlock(bool force)唤醒，Commitunlock是实际进行Commit的函数：
+首先committing tx获得running tx, running tx清空，然后在互斥量tx_mutex上等一个commit_tx的ref_cond条件变量, 把事务状态从WAITTING_COMMIT(LOCKED)变为COMMITTING
 ```cpp
 GCFSErr Journal::CommitUnlock(bool force) {
     ...
@@ -66,22 +87,42 @@ GCFSErr Journal::CommitUnlock(bool force) {
 }
 ```
 等待的tx->ref_cond由StopTx唤醒，也即当tx要停止时，ref_count--（StartTx时ref_count++）
-阶段1：事务进入到写入状态（T_FLUSH）。事务被标记为正在向日志提交。这一阶段中，也会标记该日志中没有运行状态的事务存在；这样，新的handles请求将会导致新的事务初始化。
-```cpp
-Transaction* Journal::StartTx() {
-    pthread_mutex_lock(&this->journal_tx_mutex);
-    if (this->commit_tx != nullptr && this->commit_tx->tx_state == TX_WAITTING_COMMIT) {
-        pthread_cond_wait(&this->commit_state_cond, &this->journal_tx_mutex);
-    }
 
-    if (this->running_tx == nullptr) {
-        this->running_tx = new Transaction();
-        this->running_tx->tx_state = TX_RUNNING;
+回到正题，刚才事务从RUNNING变成了WAIT_COMMIT，接着往下。
+
+阶段1：事务进入到写入状态（T_FLUSH, TX_COMMITTING）。事务被标记为正在向日志提交。这一阶段中，也会标记该日志中没有运行状态的事务存在；这样，新的handles请求将会导致新的事务初始化。
+
+如上面代码所示，WAITTTING_COMMIT阶段下等一个commit_tx->ref_cond即可变为TX_COMMITTING状态, ref_cond由StopTx里面ref_count==0判断成功后被signal。
+```cpp
+void Journal::StopTx(Transaction* tx) {
+    pthread_mutex_lock(&this->journal_tx_mutex);
+    tx->ref_count--;
+    if (tx->ref_count <= 0) {
+        pthread_cond_signal(&tx->ref_cond);
     }
-    this->running_tx->ref_count++;
-    Transaction* tx = this->running_tx;
+    // tx的块太多了，需要停下来（等待同步的commit）在放tx继续运行
+    if (tx->block_num >= STOP_TX_MAX_BLOCK_NUM && this->commit_tx != nullptr && this->commit_tx->tx_state == TX_COMMITTING)
+    {
+        WaitForCommitDone();
+    }
     pthread_mutex_unlock(&this->journal_tx_mutex);
-    return tx;
+    
+    // 异步提交tx（异步的commit）
+    if (tx->block_num >= TX_MAX_BLOCK_NUM) {
+        CallCommit();
+    }
 }
 ```
-Journal::commit_state_cond由Journal::CommitUnlock(bool force)唤醒，也即Journal::commit_tx->ref_cond为0, (commit)tx状态由TX_WAITTING_COMMIT变为TX_COMMITTING后, 新的running_tx可以继续（应该是commit_tx由WAITTING_COMMIT变为TX_COMMITTING时，没有非空running存在？）
+
+注：进入TX_COMMITTING后广播唤醒commit_state_cond, 
+```cpp
+pthread_cond_broadcast(&this->commit_state_cond)
+```
+新的running_tx可以继续（应该是commit_tx由WAITTING_COMMIT变为TX_COMMITTING时，没有非空running存在？）
+
+阶段2：事务实际使用的缓冲们被写入到磁盘上。首先是数据缓冲。由于数据缓冲不存储到日志记录区域，所以没有什么麻烦的。相反，他们会直接写到磁盘的真实位置。这一阶段在这些缓冲都被接收、收到IO完成提示后结束。
+
+注：泽杰的这个GlobalCache代码似乎没有提现这一段，或者在事务代码被文件系统代码使用的时候才能提现。
+
+阶段3：
+未完待续，优先级较低
